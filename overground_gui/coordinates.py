@@ -59,6 +59,21 @@ def speakable_coord(coord: Coord) -> str:
     return f"{letters} {col}"
 
 
+def coord_indices(coord: Coord, rows: list[str]) -> Tuple[int, int]:
+    """Return 0-based (row_index, col_index) for a coordinate."""
+    row, col = coord
+    return rows.index(row), col - 1
+
+
+def are_adjacent(a: Coord, b: Coord, rows: list[str]) -> bool:
+    """True if a and b are 8-neighbors (Chebyshev distance == 1)."""
+    if a == b:
+        return False
+    r0, c0 = coord_indices(a, rows)
+    r1, c1 = coord_indices(b, rows)
+    return max(abs(r0 - r1), abs(c0 - c1)) == 1
+
+
 def random_coordinate_stream(
     height: int,
     width: int,
@@ -66,14 +81,28 @@ def random_coordinate_stream(
     rng: Optional[random.Random] = None,
     exclude: Optional[Coord] = None,
 ) -> Iterator[Coord]:
-    """Endless stream of random grid coordinates, never repeating the last one."""
+    """Endless stream of random grid coordinates, never repeating the last one.
+
+    Adjacent (too-close) picks are counted; every other adjacent candidate is
+    resampled from non-adjacent cells when any exist, so close targets are
+    less prevalent without being banned entirely.
+    """
     rng = rng or random.Random()
+    rows = row_labels(height)
     coords = all_coordinates(height, width)
     if not coords:
         raise ValueError("grid has no cells")
     last = exclude
+    adjacent_count = 0
     while True:
-        choices = [c for c in coords if c != last] if len(coords) > 1 else coords
+        choices = [c for c in coords if c != last] if len(coords) > 1 else list(coords)
         nxt = rng.choice(choices)
+        if last is not None and len(choices) > 1 and are_adjacent(last, nxt, rows):
+            adjacent_count += 1
+            # Every other adjacent choice: resample from non-adjacent cells.
+            if adjacent_count % 2 == 0:
+                non_adjacent = [c for c in choices if not are_adjacent(last, c, rows)]
+                if non_adjacent:
+                    nxt = rng.choice(non_adjacent)
         last = nxt
         yield nxt

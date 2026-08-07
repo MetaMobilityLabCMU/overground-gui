@@ -7,9 +7,12 @@ and advances to the next random target coordinate.
 
 from __future__ import annotations
 
+import csv
 import math
+from datetime import datetime, timezone
+from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Iterator, Optional, Tuple
 
 from overground_gui.coordinates import (
@@ -56,6 +59,9 @@ class OvergroundGUI:
         self.target: Optional[Coord] = None
         self._stream: Optional[Iterator[Coord]] = None
         self._session_active = False
+        # Ordered cue sequence for the active trial: starting cell, then each target.
+        self._trial_coords: list[Coord] = []
+        self._trial_dirty = False
 
         self.speaker = Speaker()
         self._cell_rects: dict[Coord, int] = {}
@@ -95,6 +101,12 @@ class OvergroundGUI:
         apply_btn = ttk.Button(top, text="Apply grid", command=self._on_apply)
         apply_btn.grid(row=0, column=5, padx=(16, 0))
 
+        save_btn = ttk.Button(top, text="Save", command=self._on_save)
+        save_btn.grid(row=0, column=6, padx=(8, 0))
+
+        reset_btn = ttk.Button(top, text="Reset", command=self._on_reset)
+        reset_btn.grid(row=0, column=7, padx=(8, 0))
+
         speaker_text = "Speaker mode"
         if not self.speaker.available:
             speaker_text += " (TTS unavailable)"
@@ -105,7 +117,7 @@ class OvergroundGUI:
             command=self._on_speaker_toggle,
             state=tk.NORMAL if self.speaker.available else tk.DISABLED,
         )
-        speaker_cb.grid(row=0, column=6, padx=(16, 0))
+        speaker_cb.grid(row=0, column=8, padx=(16, 0))
 
         status = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         status.pack(side=tk.TOP, fill=tk.X)
@@ -117,6 +129,9 @@ class OvergroundGUI:
         ttk.Label(status, text="Current", style="Header.TLabel").pack(side=tk.LEFT)
         self.current_label = ttk.Label(status, text="—", style="Big.TLabel")
         self.current_label.pack(side=tk.LEFT, padx=(12, 24))
+
+        self.steps_label = ttk.Label(status, text="Steps: 0", style="Hint.TLabel")
+        self.steps_label.pack(side=tk.LEFT, padx=(0, 16))
 
         self.hint_label = ttk.Label(
             status,
@@ -136,7 +151,7 @@ class OvergroundGUI:
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
         # Keep focus for spacebar even after clicking widgets
-        for w in (self.root, self.canvas, h_spin, w_spin, apply_btn, speaker_cb):
+        for w in (self.root, self.canvas, h_spin, w_spin, apply_btn, save_btn, reset_btn, speaker_cb):
             w.bind("<Button-1>", lambda e: self.root.focus_set(), add="+")
 
     def _draw_legend_swatches(self, parent: ttk.Frame) -> None:
@@ -149,7 +164,72 @@ class OvergroundGUI:
         ttk.Label(parent, text="Arrow: current → target", style="Hint.TLabel").pack(side=tk.LEFT)
 
     def _on_apply(self) -> None:
+        if self._trial_dirty:
+            if not messagebox.askyesno(
+                "Apply grid",
+                "Applying a new grid starts a new trial and discards unsaved coordinates.\n\nContinue?",
+            ):
+                self.root.focus_set()
+                return
         self._apply_grid(start_session=True)
+
+    def _on_reset(self) -> None:
+        detail = (
+            "Unsaved trial coordinates will be discarded.\n\n"
+            if self._trial_dirty
+            else ""
+        )
+        if not messagebox.askyesno(
+            "Reset trial",
+            f"Reset for the next trial?\n\n{detail}"
+            "This clears the current trial sequence and picks new start/target coordinates.",
+        ):
+            self.root.focus_set()
+            return
+        self._apply_grid(start_session=True)
+
+    def _on_save(self) -> None:
+        if not self._trial_coords:
+            messagebox.showinfo("Save trial", "Nothing to save yet.")
+            self.root.focus_set()
+            return
+
+        default_name = datetime.now().strftime("trial_%Y%m%d_%H%M%S.csv")
+        path = filedialog.asksaveasfilename(
+            title="Save trial contents",
+            defaultextension=".csv",
+            initialfile=default_name,
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            self.root.focus_set()
+            return
+
+        try:
+            self._write_trial_csv(Path(path))
+        except OSError as exc:
+            messagebox.showerror("Save failed", f"Could not save trial:\n{exc}")
+            self.root.focus_set()
+            return
+
+        self._trial_dirty = False
+        messagebox.showinfo("Save trial", f"Saved {len(self._trial_coords)} coordinates to:\n{path}")
+        self.root.focus_set()
+
+    def _write_trial_csv(self, path: Path) -> None:
+        h = len(self.rows)
+        w = len(self.cols)
+        saved_at = datetime.now(timezone.utc).isoformat()
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["# overground-gui trial"])
+            writer.writerow(["# grid_height", h])
+            writer.writerow(["# grid_width", w])
+            writer.writerow(["# saved_at_utc", saved_at])
+            writer.writerow(["step", "role", "coordinate"])
+            for i, coord in enumerate(self._trial_coords):
+                role = "start" if i == 0 else "target"
+                writer.writerow([i, role, format_coord(coord)])
 
     def _apply_grid(self, start_session: bool) -> None:
         try:
@@ -170,10 +250,11 @@ class OvergroundGUI:
         self._stream = random_coordinate_stream(h, w)
 
         if start_session:
-            # First target becomes the subject's starting "current" after first Space;
-            # we seed current as a random cell and immediately pick a distinct target.
+            # Seed current, then pick a distinct target (adjacency resampling applies).
             self.current = next(self._stream)
             self.target = next(self._stream)
+            self._trial_coords = [self.current, self.target]
+            self._trial_dirty = False
             self._session_active = True
             self._announce_target()
 
@@ -200,6 +281,8 @@ class OvergroundGUI:
             return "break"
         self.current = self.target
         self.target = next(self._stream)
+        self._trial_coords.append(self.target)
+        self._trial_dirty = True
         self._update_labels()
         self._redraw()
         self._announce_target()
@@ -208,6 +291,9 @@ class OvergroundGUI:
     def _update_labels(self) -> None:
         self.target_label.configure(text=format_coord(self.target) if self.target else "—")
         self.current_label.configure(text=format_coord(self.current) if self.current else "—")
+        # Steps = confirmed advances (targets after the start cell).
+        steps = max(0, len(self._trial_coords) - 1)
+        self.steps_label.configure(text=f"Steps: {steps}")
 
     def _on_resize(self, _event: Optional[tk.Event] = None) -> None:
         if getattr(self, "_resize_job", None):
