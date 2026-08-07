@@ -1,0 +1,9 @@
+name: jinwoo-gui
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - tk
+  - pip
+  - pip:
+      - -e .
