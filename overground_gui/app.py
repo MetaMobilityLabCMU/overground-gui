@@ -52,6 +52,7 @@ class OvergroundGUI:
         self.height = tk.IntVar(value=5)
         self.width = tk.IntVar(value=5)
         self.speaker_mode = tk.BooleanVar(value=False)
+        self.fast_mode = tk.BooleanVar(value=False)
 
         self.rows: list[str] = []
         self.cols: list[int] = []
@@ -107,6 +108,14 @@ class OvergroundGUI:
         reset_btn = ttk.Button(top, text="Reset", command=self._on_reset)
         reset_btn.grid(row=0, column=7, padx=(8, 0))
 
+        fast_cb = ttk.Checkbutton(
+            top,
+            text="Fast mode",
+            variable=self.fast_mode,
+            command=self._on_fast_toggle,
+        )
+        fast_cb.grid(row=0, column=8, padx=(16, 0))
+
         speaker_text = "Speaker mode"
         if not self.speaker.available:
             speaker_text += " (TTS unavailable)"
@@ -117,7 +126,7 @@ class OvergroundGUI:
             command=self._on_speaker_toggle,
             state=tk.NORMAL if self.speaker.available else tk.DISABLED,
         )
-        speaker_cb.grid(row=0, column=8, padx=(16, 0))
+        speaker_cb.grid(row=0, column=9, padx=(12, 0))
 
         status = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         status.pack(side=tk.TOP, fill=tk.X)
@@ -151,7 +160,7 @@ class OvergroundGUI:
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
         # Keep focus for spacebar even after clicking widgets
-        for w in (self.root, self.canvas, h_spin, w_spin, apply_btn, save_btn, reset_btn, speaker_cb):
+        for w in (self.root, self.canvas, h_spin, w_spin, apply_btn, save_btn, reset_btn, fast_cb, speaker_cb):
             w.bind("<Button-1>", lambda e: self.root.focus_set(), add="+")
 
     def _draw_legend_swatches(self, parent: ttk.Frame) -> None:
@@ -225,11 +234,22 @@ class OvergroundGUI:
             writer.writerow(["# overground-gui trial"])
             writer.writerow(["# grid_height", h])
             writer.writerow(["# grid_width", w])
+            writer.writerow(["# mode", "fast" if self.fast_mode.get() else "normal"])
             writer.writerow(["# saved_at_utc", saved_at])
             writer.writerow(["step", "role", "coordinate"])
             for i, coord in enumerate(self._trial_coords):
                 role = "start" if i == 0 else "target"
                 writer.writerow([i, role, format_coord(coord)])
+
+    def _sampling_mode(self) -> str:
+        return "fast" if self.fast_mode.get() else "normal"
+
+    def _rebuild_stream(self, *, exclude: Optional[Coord] = None) -> None:
+        h = len(self.rows)
+        w = len(self.cols)
+        if h < 1 or w < 1:
+            return
+        self._stream = random_coordinate_stream(h, w, mode=self._sampling_mode(), exclude=exclude)
 
     def _apply_grid(self, start_session: bool) -> None:
         try:
@@ -247,10 +267,10 @@ class OvergroundGUI:
 
         self.rows = row_labels(h)
         self.cols = list(range(1, w + 1))
-        self._stream = random_coordinate_stream(h, w)
+        self._rebuild_stream()
 
         if start_session:
-            # Seed current, then pick a distinct target (adjacency resampling applies).
+            # Seed current, then pick a distinct target (mode rules apply to the target).
             self.current = next(self._stream)
             self.target = next(self._stream)
             self._trial_coords = [self.current, self.target]
@@ -260,6 +280,13 @@ class OvergroundGUI:
 
         self._update_labels()
         self._redraw()
+        self.root.focus_set()
+
+    def _on_fast_toggle(self) -> None:
+        # Rebuild so subsequent Space advances use the new sampling rule.
+        # Exclude the current target so the next pick is relative to it after Space.
+        exclude = self.target if self.target is not None else self.current
+        self._rebuild_stream(exclude=exclude)
         self.root.focus_set()
 
     def _on_speaker_toggle(self) -> None:

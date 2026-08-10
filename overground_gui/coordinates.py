@@ -74,19 +74,60 @@ def are_adjacent(a: Coord, b: Coord, rows: list[str]) -> bool:
     return max(abs(r0 - r1), abs(c0 - c1)) == 1
 
 
+def manhattan_distance(a: Coord, b: Coord, rows: list[str]) -> int:
+    """Taxi-geometry (Manhattan) distance between two coordinates."""
+    r0, c0 = coord_indices(a, rows)
+    r1, c1 = coord_indices(b, rows)
+    return abs(r0 - r1) + abs(c0 - c1)
+
+
+# Fast mode: only steps strictly further than this Manhattan distance.
+FAST_MIN_MANHATTAN = 3
+
+
+def _pick_fast_target(
+    rng: random.Random,
+    coords: list[Coord],
+    last: Coord,
+    rows: list[str],
+) -> Coord:
+    """Pick a far target: Manhattan > 3, weighted toward longer distances."""
+    others = [c for c in coords if c != last]
+    if not others:
+        return last
+
+    far = [c for c in others if manhattan_distance(last, c, rows) > FAST_MIN_MANHATTAN]
+    if far:
+        weights = [manhattan_distance(last, c, rows) for c in far]
+        return rng.choices(far, weights=weights, k=1)[0]
+
+    # Small grids: no cell beyond the threshold — fall back to farthest cells.
+    max_d = max(manhattan_distance(last, c, rows) for c in others)
+    farthest = [c for c in others if manhattan_distance(last, c, rows) == max_d]
+    return rng.choice(farthest)
+
+
 def random_coordinate_stream(
     height: int,
     width: int,
     *,
     rng: Optional[random.Random] = None,
     exclude: Optional[Coord] = None,
+    mode: str = "normal",
 ) -> Iterator[Coord]:
     """Endless stream of random grid coordinates, never repeating the last one.
 
-    Adjacent (too-close) picks are counted; every other adjacent candidate is
-    resampled from non-adjacent cells when any exist, so close targets are
-    less prevalent without being banned entirely.
+    mode="normal":
+        Adjacent (too-close) picks are counted; every other adjacent candidate is
+        resampled from non-adjacent cells when any exist.
+
+    mode="fast":
+        Next step must have Manhattan distance > 3 from the previous coordinate
+        when possible, with selection weighted by distance (longer favored).
     """
+    if mode not in ("normal", "fast"):
+        raise ValueError(f"unknown mode: {mode}")
+
     rng = rng or random.Random()
     rows = row_labels(height)
     coords = all_coordinates(height, width)
@@ -95,14 +136,19 @@ def random_coordinate_stream(
     last = exclude
     adjacent_count = 0
     while True:
-        choices = [c for c in coords if c != last] if len(coords) > 1 else list(coords)
-        nxt = rng.choice(choices)
-        if last is not None and len(choices) > 1 and are_adjacent(last, nxt, rows):
-            adjacent_count += 1
-            # Every other adjacent choice: resample from non-adjacent cells.
-            if adjacent_count % 2 == 0:
-                non_adjacent = [c for c in choices if not are_adjacent(last, c, rows)]
-                if non_adjacent:
-                    nxt = rng.choice(non_adjacent)
+        if last is None:
+            nxt = rng.choice(coords)
+        elif mode == "fast":
+            nxt = _pick_fast_target(rng, coords, last, rows)
+        else:
+            choices = [c for c in coords if c != last] if len(coords) > 1 else list(coords)
+            nxt = rng.choice(choices)
+            if len(choices) > 1 and are_adjacent(last, nxt, rows):
+                adjacent_count += 1
+                # Every other adjacent choice: resample from non-adjacent cells.
+                if adjacent_count % 2 == 0:
+                    non_adjacent = [c for c in choices if not are_adjacent(last, c, rows)]
+                    if non_adjacent:
+                        nxt = rng.choice(non_adjacent)
         last = nxt
         yield nxt
