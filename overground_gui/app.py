@@ -2,13 +2,14 @@
 """Overground navigation cue GUI.
 
 Grid rows are letters (H), columns are numbers (W). Space confirms arrival
-and advances to the next random target coordinate.
+at the target (via the shown waypoint) and advances to the next leg.
 """
 
 from __future__ import annotations
 
 import csv
 import math
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 import tkinter as tk
@@ -17,20 +18,27 @@ from typing import Iterator, Optional, Tuple
 
 from overground_gui.coordinates import (
     Coord,
+    can_place_waypoint,
     format_coord,
+    is_valid_target,
     random_coordinate_stream,
+    rectangle_cells,
     row_labels,
+    sample_waypoint,
     speakable_coord,
 )
 from overground_gui.speaker import Speaker
 
 # Shared highlight hue (teal); alpha differs for current vs target.
 COLOR_HIGHLIGHT = (46, 160, 154)  # RGB
+COLOR_WAYPOINT = (214, 137, 16)  # amber
+COLOR_RECT = (46, 160, 154)
 COLOR_GRID_LINE = "#2c3e50"
 COLOR_LABEL = "#1a252f"
 COLOR_BG = "#e8eef2"
 COLOR_CELL = "#f7fafb"
 COLOR_ARROW = "#1b4f72"
+COLOR_ARROW_WAYPOINT = "#b9770e"
 
 
 def rgba_hex(rgb: Tuple[int, int, int], alpha: float, bg: Tuple[int, int, int] = (247, 250, 251)) -> str:
@@ -46,23 +54,27 @@ class OvergroundGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Overground Coordinate Cue")
-        self.root.minsize(720, 560)
+        self.root.minsize(780, 560)
         self.root.configure(bg=COLOR_BG)
 
-        self.height = tk.IntVar(value=5)
-        self.width = tk.IntVar(value=5)
+        self.height = tk.IntVar(value=3)
+        self.width = tk.IntVar(value=6)
         self.speaker_mode = tk.BooleanVar(value=False)
-        self.fast_mode = tk.BooleanVar(value=False)
+        # Trial pace label: slow/medium share sampling; fast is stricter.
+        self.pace_mode = tk.StringVar(value="medium")
 
         self.rows: list[str] = []
         self.cols: list[int] = []
         self.current: Optional[Coord] = None
+        self.waypoint: Optional[Coord] = None
         self.target: Optional[Coord] = None
         self._stream: Optional[Iterator[Coord]] = None
         self._session_active = False
-        # Ordered cue sequence for the active trial: starting cell, then each target.
-        self._trial_coords: list[Coord] = []
+        self._rng = random.Random()
+        # Trial log rows: dicts with step/role/coordinate.
+        self._trial_log: list[dict[str, object]] = []
         self._trial_dirty = False
+        self._leg_index = 0
 
         self.speaker = Speaker()
         self._cell_rects: dict[Coord, int] = {}
@@ -82,8 +94,10 @@ class OvergroundGUI:
         style.configure("TFrame", background=COLOR_BG)
         style.configure("TLabel", background=COLOR_BG, foreground=COLOR_LABEL)
         style.configure("TCheckbutton", background=COLOR_BG)
+        style.configure("TRadiobutton", background=COLOR_BG)
         style.configure("Header.TLabel", font=("Helvetica", 12, "bold"))
         style.configure("Big.TLabel", font=("Helvetica", 28, "bold"), foreground="#0d3b4c")
+        style.configure("Waypoint.TLabel", font=("Helvetica", 28, "bold"), foreground="#9a5b00")
         style.configure("Hint.TLabel", font=("Helvetica", 10), foreground="#5a6a75")
 
         top = ttk.Frame(self.root, padding=(12, 10))
@@ -108,13 +122,22 @@ class OvergroundGUI:
         reset_btn = ttk.Button(top, text="Reset", command=self._on_reset)
         reset_btn.grid(row=0, column=7, padx=(8, 0))
 
-        fast_cb = ttk.Checkbutton(
-            top,
-            text="Fast mode",
-            variable=self.fast_mode,
-            command=self._on_fast_toggle,
-        )
-        fast_cb.grid(row=0, column=8, padx=(16, 0))
+        ttk.Label(top, text="Mode").grid(row=0, column=8, sticky="e", padx=(16, 4))
+        mode_frame = ttk.Frame(top)
+        mode_frame.grid(row=0, column=9, sticky="w")
+        mode_radios = []
+        for i, (value, label) in enumerate(
+            (("slow", "Slow"), ("medium", "Medium"), ("fast", "Fast"))
+        ):
+            rb = ttk.Radiobutton(
+                mode_frame,
+                text=label,
+                value=value,
+                variable=self.pace_mode,
+                command=self._on_mode_change,
+            )
+            rb.pack(side=tk.LEFT, padx=(0, 8))
+            mode_radios.append(rb)
 
         speaker_text = "Speaker mode"
         if not self.speaker.available:
@@ -126,7 +149,7 @@ class OvergroundGUI:
             command=self._on_speaker_toggle,
             state=tk.NORMAL if self.speaker.available else tk.DISABLED,
         )
-        speaker_cb.grid(row=0, column=9, padx=(12, 0))
+        speaker_cb.grid(row=0, column=10, padx=(12, 0))
 
         status = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         status.pack(side=tk.TOP, fill=tk.X)
@@ -134,6 +157,10 @@ class OvergroundGUI:
         ttk.Label(status, text="Target", style="Header.TLabel").pack(side=tk.LEFT)
         self.target_label = ttk.Label(status, text="—", style="Big.TLabel")
         self.target_label.pack(side=tk.LEFT, padx=(12, 24))
+
+        ttk.Label(status, text="Waypoint", style="Header.TLabel").pack(side=tk.LEFT)
+        self.waypoint_label = ttk.Label(status, text="—", style="Waypoint.TLabel")
+        self.waypoint_label.pack(side=tk.LEFT, padx=(12, 24))
 
         ttk.Label(status, text="Current", style="Header.TLabel").pack(side=tk.LEFT)
         self.current_label = ttk.Label(status, text="—", style="Big.TLabel")
@@ -144,7 +171,7 @@ class OvergroundGUI:
 
         self.hint_label = ttk.Label(
             status,
-            text="Space = confirm arrival & next coordinate",
+            text="Space = confirm arrival at target (via waypoint)",
             style="Hint.TLabel",
         )
         self.hint_label.pack(side=tk.RIGHT)
@@ -160,17 +187,32 @@ class OvergroundGUI:
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
         # Keep focus for spacebar even after clicking widgets
-        for w in (self.root, self.canvas, h_spin, w_spin, apply_btn, save_btn, reset_btn, fast_cb, speaker_cb):
+        focus_widgets = [
+            self.root,
+            self.canvas,
+            h_spin,
+            w_spin,
+            apply_btn,
+            save_btn,
+            reset_btn,
+            speaker_cb,
+            *mode_radios,
+        ]
+        for w in focus_widgets:
             w.bind("<Button-1>", lambda e: self.root.focus_set(), add="+")
 
     def _draw_legend_swatches(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Legend:", style="Hint.TLabel").pack(side=tk.LEFT, padx=(0, 8))
-        for label, alpha in (("Current (opaque)", 0.85), ("Target", 0.40)):
+        for label, rgb, alpha in (
+            ("Current", COLOR_HIGHLIGHT, 0.85),
+            ("Waypoint", COLOR_WAYPOINT, 0.70),
+            ("Target", COLOR_HIGHLIGHT, 0.40),
+        ):
             sw = tk.Canvas(parent, width=18, height=18, highlightthickness=0, bg=COLOR_BG)
             sw.pack(side=tk.LEFT, padx=(0, 4))
-            sw.create_rectangle(1, 1, 17, 17, fill=rgba_hex(COLOR_HIGHLIGHT, alpha), outline=COLOR_GRID_LINE)
+            sw.create_rectangle(1, 1, 17, 17, fill=rgba_hex(rgb, alpha), outline=COLOR_GRID_LINE)
             ttk.Label(parent, text=label, style="Hint.TLabel").pack(side=tk.LEFT, padx=(0, 14))
-        ttk.Label(parent, text="Arrow: current → target", style="Hint.TLabel").pack(side=tk.LEFT)
+        ttk.Label(parent, text="Path: current → waypoint → target", style="Hint.TLabel").pack(side=tk.LEFT)
 
     def _on_apply(self) -> None:
         if self._trial_dirty:
@@ -198,7 +240,7 @@ class OvergroundGUI:
         self._apply_grid(start_session=True)
 
     def _on_save(self) -> None:
-        if not self._trial_coords:
+        if not self._trial_log:
             messagebox.showinfo("Save trial", "Nothing to save yet.")
             self.root.focus_set()
             return
@@ -222,7 +264,7 @@ class OvergroundGUI:
             return
 
         self._trial_dirty = False
-        messagebox.showinfo("Save trial", f"Saved {len(self._trial_coords)} coordinates to:\n{path}")
+        messagebox.showinfo("Save trial", f"Saved {len(self._trial_log)} rows to:\n{path}")
         self.root.focus_set()
 
     def _write_trial_csv(self, path: Path) -> None:
@@ -234,22 +276,101 @@ class OvergroundGUI:
             writer.writerow(["# overground-gui trial"])
             writer.writerow(["# grid_height", h])
             writer.writerow(["# grid_width", w])
-            writer.writerow(["# mode", "fast" if self.fast_mode.get() else "normal"])
             writer.writerow(["# saved_at_utc", saved_at])
-            writer.writerow(["step", "role", "coordinate"])
-            for i, coord in enumerate(self._trial_coords):
-                role = "start" if i == 0 else "target"
-                writer.writerow([i, role, format_coord(coord)])
+            writer.writerow(["step", "role", "coordinate", "mode"])
+            for row in self._trial_log:
+                writer.writerow([row["step"], row["role"], row["coordinate"], row["mode"]])
 
-    def _sampling_mode(self) -> str:
-        return "fast" if self.fast_mode.get() else "normal"
+    def _log_row(self, step: int, role: str, coordinate: str, *, mode: Optional[str] = None) -> None:
+        self._trial_log.append(
+            {
+                "step": step,
+                "role": role,
+                "coordinate": coordinate,
+                "mode": mode if mode is not None else self._pace_mode(),
+            }
+        )
+
+    def _pace_mode(self) -> str:
+        mode = self.pace_mode.get()
+        return mode if mode in ("slow", "medium", "fast") else "medium"
 
     def _rebuild_stream(self, *, exclude: Optional[Coord] = None) -> None:
         h = len(self.rows)
         w = len(self.cols)
         if h < 1 or w < 1:
             return
-        self._stream = random_coordinate_stream(h, w, mode=self._sampling_mode(), exclude=exclude)
+        self._stream = random_coordinate_stream(h, w, mode=self._pace_mode(), exclude=exclude)
+
+    def _target_ok(self, candidate: Coord) -> bool:
+        assert self.current is not None
+        return is_valid_target(
+            self.current, candidate, self.rows, mode=self._pace_mode()
+        )
+
+    def _next_target_from_stream(self) -> Coord:
+        """Draw a target that satisfies the active mode constraints."""
+        assert self._stream is not None and self.current is not None
+        for _ in range(64):
+            candidate = next(self._stream)
+            if self._target_ok(candidate):
+                return candidate
+        return candidate
+
+    def _set_waypoint_for_leg(self) -> None:
+        """Sample one waypoint for the current→target leg (guidance only)."""
+        assert self.current is not None and self.target is not None
+        if can_place_waypoint(self.current, self.target, self.rows):
+            self.waypoint = sample_waypoint(
+                self.current,
+                self.target,
+                self.rows,
+                rng=self._rng,
+                mode=self._pace_mode(),
+            )
+        else:
+            self.waypoint = None
+
+    def _begin_leg(self, target: Optional[Coord] = None, *, log: bool) -> None:
+        """Choose a destination and waypoint. Current stays until Space reaches target."""
+        assert self.current is not None
+        chosen_target: Optional[Coord] = None
+        for _ in range(64):
+            if target is not None and self._target_ok(target):
+                candidate = target
+            else:
+                candidate = self._next_target_from_stream()
+            chosen_target = candidate
+            if self._target_ok(candidate):
+                break
+            target = None
+
+        self.target = chosen_target
+        self._set_waypoint_for_leg()
+        # If no waypoint fit (should be rare), keep resampling for a valid leg.
+        if self.waypoint is None:
+            for _ in range(64):
+                self.target = self._next_target_from_stream()
+                self._set_waypoint_for_leg()
+                if self.waypoint is not None:
+                    break
+
+        if log:
+            self._leg_index += 1
+            mode = self._pace_mode()
+            if self.waypoint is not None:
+                self._log_row(
+                    self._leg_index,
+                    "waypoint",
+                    format_coord(self.waypoint),
+                    mode=mode,
+                )
+            self._log_row(
+                self._leg_index,
+                "target",
+                format_coord(self.target),
+                mode=mode,
+            )
 
     def _apply_grid(self, start_session: bool) -> None:
         try:
@@ -270,10 +391,11 @@ class OvergroundGUI:
         self._rebuild_stream()
 
         if start_session:
-            # Seed current, then pick a distinct target (mode rules apply to the target).
             self.current = next(self._stream)
-            self.target = next(self._stream)
-            self._trial_coords = [self.current, self.target]
+            self._trial_log = []
+            self._log_row(0, "start", format_coord(self.current))
+            self._leg_index = 0
+            self._begin_leg(log=True)
             self._trial_dirty = False
             self._session_active = True
             self._announce_target()
@@ -282,9 +404,8 @@ class OvergroundGUI:
         self._redraw()
         self.root.focus_set()
 
-    def _on_fast_toggle(self) -> None:
-        # Rebuild so subsequent Space advances use the new sampling rule.
-        # Exclude the current target so the next pick is relative to it after Space.
+    def _on_mode_change(self) -> None:
+        # Rebuild sampler for subsequent legs; keep the in-progress leg as-is.
         exclude = self.target if self.target is not None else self.current
         self._rebuild_stream(exclude=exclude)
         self.root.focus_set()
@@ -306,10 +427,12 @@ class OvergroundGUI:
             return ""
         if not self._session_active or self._stream is None or self.target is None:
             return "break"
+
+        # Current always advances to the final destination, never to the waypoint.
         self.current = self.target
-        self.target = next(self._stream)
-        self._trial_coords.append(self.target)
+        self._begin_leg(log=True)
         self._trial_dirty = True
+
         self._update_labels()
         self._redraw()
         self._announce_target()
@@ -317,10 +440,11 @@ class OvergroundGUI:
 
     def _update_labels(self) -> None:
         self.target_label.configure(text=format_coord(self.target) if self.target else "—")
+        self.waypoint_label.configure(
+            text=format_coord(self.waypoint) if self.waypoint is not None else "—"
+        )
         self.current_label.configure(text=format_coord(self.current) if self.current else "—")
-        # Steps = confirmed advances (targets after the start cell).
-        steps = max(0, len(self._trial_coords) - 1)
-        self.steps_label.configure(text=f"Steps: {steps}")
+        self.steps_label.configure(text=f"Steps: {self._leg_index}")
 
     def _on_resize(self, _event: Optional[tk.Event] = None) -> None:
         if getattr(self, "_resize_job", None):
@@ -362,6 +486,10 @@ class OvergroundGUI:
         cell_h = grid_h / n_rows
         ox, oy = label_left, label_top
 
+        rect_set: set[Coord] = set()
+        if self.current is not None and self.target is not None and self.waypoint is not None:
+            rect_set = set(rectangle_cells(self.current, self.target, self.rows))
+
         # Column headers (numbers)
         for i, col in enumerate(self.cols):
             x = ox + (i + 0.5) * cell_w
@@ -380,8 +508,12 @@ class OvergroundGUI:
                 fill = COLOR_CELL
                 if self.current is not None and coord == self.current:
                     fill = rgba_hex(COLOR_HIGHLIGHT, 0.85)
+                elif self.waypoint is not None and coord == self.waypoint:
+                    fill = rgba_hex(COLOR_WAYPOINT, 0.70)
                 elif self.target is not None and coord == self.target:
                     fill = rgba_hex(COLOR_HIGHLIGHT, 0.40)
+                elif coord in rect_set:
+                    fill = rgba_hex(COLOR_RECT, 0.12)
                 rect = c.create_rectangle(x0, y0, x1, y1, fill=fill, outline=COLOR_GRID_LINE, width=1)
                 self._cell_rects[coord] = rect
                 # Subtle cell label
@@ -393,14 +525,36 @@ class OvergroundGUI:
                     font=("Helvetica", max(8, min(12, int(min(cell_w, cell_h) / 4)))),
                 )
 
-        # Arrow on top: current → target
-        if self.current is not None and self.target is not None and self.current != self.target:
-            self._draw_arrow(
-                *self._cell_center(self.current, ox, oy, cell_w, cell_h),
-                *self._cell_center(self.target, ox, oy, cell_w, cell_h),
-            )
+        # Path arrows: current → waypoint → target, or current → target on final hop.
+        if self.current is not None and self.target is not None:
+            if self.waypoint is not None and self.current != self.waypoint:
+                self._draw_arrow(
+                    *self._cell_center(self.current, ox, oy, cell_w, cell_h),
+                    *self._cell_center(self.waypoint, ox, oy, cell_w, cell_h),
+                    color=COLOR_ARROW_WAYPOINT,
+                )
+                if self.waypoint != self.target:
+                    self._draw_arrow(
+                        *self._cell_center(self.waypoint, ox, oy, cell_w, cell_h),
+                        *self._cell_center(self.target, ox, oy, cell_w, cell_h),
+                        color=COLOR_ARROW,
+                    )
+            elif self.current != self.target:
+                self._draw_arrow(
+                    *self._cell_center(self.current, ox, oy, cell_w, cell_h),
+                    *self._cell_center(self.target, ox, oy, cell_w, cell_h),
+                    color=COLOR_ARROW,
+                )
 
-    def _draw_arrow(self, x0: float, y0: float, x1: float, y1: float) -> None:
+    def _draw_arrow(
+        self,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        *,
+        color: str = COLOR_ARROW,
+    ) -> None:
         c = self.canvas
         dx, dy = x1 - x0, y1 - y0
         dist = math.hypot(dx, dy)
@@ -417,7 +571,7 @@ class OvergroundGUI:
             sy,
             ex,
             ey,
-            fill=COLOR_ARROW,
+            fill=color,
             width=3,
             arrow=tk.LAST,
             arrowshape=(14, 18, 6),
